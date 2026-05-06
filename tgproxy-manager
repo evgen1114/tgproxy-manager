@@ -13,53 +13,143 @@ command_exists() {
   command -v "$1" >/dev/null 2>&1
 }
 
-install_deps() {
-  print_info "Проверяю зависимости..."
+detect_pkg_manager() {
+  if command_exists apt-get; then
+    echo "apt-get"
+  elif command_exists apt; then
+    echo "apt"
+  elif command_exists dnf; then
+    echo "dnf"
+  elif command_exists yum; then
+    echo "yum"
+  elif command_exists apk; then
+    echo "apk"
+  else
+    echo "unknown"
+  fi
+}
 
-  if ! command_exists docker; then
-    print_err "Docker не установлен. Сначала установи Docker."
+install_base_utils() {
+  local pm
+  pm="$(detect_pkg_manager)"
+
+  case "$pm" in
+    apt-get)
+      apt-get update
+      apt-get install -y ca-certificates curl gnupg lsb-release
+      ;;
+    apt)
+      apt update
+      apt install -y ca-certificates curl gnupg lsb-release
+      ;;
+    dnf)
+      dnf install -y ca-certificates curl gnupg2
+      ;;
+    yum)
+      yum install -y ca-certificates curl
+      ;;
+    apk)
+      apk add --no-cache ca-certificates curl
+      ;;
+    *)
+      print_warn "Неизвестный пакетный менеджер. Базовые утилиты поставь вручную при необходимости."
+      ;;
+  esac
+}
+
+install_qrencode() {
+  if command_exists qrencode; then
+    return 0
+  fi
+
+  print_info "Устанавливаю qrencode..."
+  local pm
+  pm="$(detect_pkg_manager)"
+
+  case "$pm" in
+    apt-get)
+      apt-get update
+      apt-get install -y qrencode || true
+      ;;
+    apt)
+      apt update
+      apt install -y qrencode || true
+      ;;
+    dnf)
+      dnf install -y qrencode || true
+      ;;
+    yum)
+      yum install -y qrencode || true
+      ;;
+    apk)
+      apk add --no-cache qrencode || true
+      ;;
+    *)
+      print_warn "Не удалось определить пакетный менеджер для qrencode."
+      ;;
+  esac
+
+  if command_exists qrencode; then
+    print_ok "qrencode установлен."
+  else
+    print_warn "qrencode не установлен. QR-коды будут недоступны."
+  fi
+}
+
+install_docker() {
+  if command_exists docker; then
+    print_ok "Docker уже установлен."
+    return 0
+  fi
+
+  print_info "Docker не найден. Устанавливаю Docker..."
+  install_base_utils
+
+  if ! command_exists curl; then
+    print_err "curl отсутствует, не могу скачать установщик Docker."
     exit 1
   fi
 
-  if ! command_exists curl; then
-    print_info "Устанавливаю curl..."
-    if command_exists apt-get; then
-      apt-get update && apt-get install -y curl
-    elif command_exists apt; then
-      apt update && apt install -y curl
-    elif command_exists dnf; then
-      dnf install -y curl
-    elif command_exists yum; then
-      yum install -y curl
-    elif command_exists apk; then
-      apk add --no-cache curl
-    else
-      print_err "Не удалось установить curl автоматически."
-      exit 1
-    fi
+  curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+  sh /tmp/get-docker.sh
+  rm -f /tmp/get-docker.sh
+
+  if ! command_exists docker; then
+    print_err "Docker не установился."
+    exit 1
   fi
 
-  if ! command_exists qrencode; then
-    print_info "Пытаюсь установить qrencode..."
-    if command_exists apt-get; then
-      apt-get update && apt-get install -y qrencode || true
-    elif command_exists apt; then
-      apt update && apt install -y qrencode || true
-    elif command_exists dnf; then
-      dnf install -y qrencode || true
-    elif command_exists yum; then
-      yum install -y qrencode || true
-    elif command_exists apk; then
-      apk add --no-cache qrencode || true
-    else
-      print_warn "Пакетный менеджер не определён, qrencode поставь вручную."
-    fi
+  if command_exists systemctl; then
+    systemctl enable docker >/dev/null 2>&1 || true
+    systemctl restart docker >/dev/null 2>&1 || true
+  elif command_exists service; then
+    service docker start >/dev/null 2>&1 || true
   fi
+
+  sleep 2
+
+  if docker info >/dev/null 2>&1; then
+    print_ok "Docker установлен и работает."
+  else
+    print_warn "Docker установлен, но демон может ещё запускаться. Проверь: systemctl status docker"
+  fi
+}
+
+install_deps() {
+  print_info "Проверяю зависимости..."
+
+  if ! command_exists curl; then
+    print_info "curl не найден. Устанавливаю..."
+    install_base_utils
+  fi
+
+  install_docker
+  install_qrencode
 }
 
 cleanup_installation() {
   print_info "Удаляю контейнеры tgproxy..."
-  docker ps -a --format '{{.Names}}' | grep -E '^(tgproxy-mtg-|tgproxy-socks-)' | while read -r name; do
+  docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^(tgproxy-mtg-|tgproxy-socks-)' | while read -r name; do
     docker rm -f "$name" >/dev/null 2>&1 || true
   done || true
 
@@ -337,9 +427,37 @@ print_qr() {
   fi
 }
 
+get_started_at() {
+  local cname="$1"
+  docker inspect --format '{{.State.StartedAt}}' "$cname" 2>/dev/null | cut -d'.' -f1 | sed 's/T/ /' | sed 's/Z$//' || true
+}
+
+get_traffic() {
+  local cname="$1"
+  local line io
+  line="$(docker stats --no-stream --format '{{.Name}}|{{.NetIO}}' 2>/dev/null | grep -F "${cname}|" || true)"
+  io="$(echo "$line" | awk -F'|' '{print $2}')"
+  if [[ -z "${io:-}" ]]; then
+    echo "-"
+  else
+    echo "$io"
+  fi
+}
+
+get_last_log_time() {
+  local cname="$1"
+  local line
+  line="$(docker logs --timestamps --tail 1 "$cname" 2>/dev/null | head -n 1 || true)"
+  if [[ -z "${line:-}" ]]; then
+    echo "-"
+    return 0
+  fi
+  echo "$line" | awk '{print $1}' | cut -d'.' -f1 | sed 's/T/ /' | sed 's/Z$//'
+}
+
 show_proxy_info() {
   local id="$1"
-  local cfg
+  local cfg started_at traffic last_log
   cfg="$(config_path_by_id "$id")"
 
   if ! load_proxy_config "$cfg"; then
@@ -347,11 +465,19 @@ show_proxy_info() {
     return 1
   fi
 
+  started_at="$(get_started_at "${CONTAINER_NAME:-}")"
+  traffic="$(get_traffic "${CONTAINER_NAME:-}")"
+  last_log="$(get_last_log_time "${CONTAINER_NAME:-}")"
+
   echo "ID: ${CLIENT_ID:-}"
   echo "Тип: ${TYPE:-}"
   echo "Контейнер: ${CONTAINER_NAME:-}"
   echo "Хост: ${PUBLIC_HOST:-}"
   echo "Порт: ${PORT:-}"
+  echo "Создан: ${CREATED_AT:-"-"}"
+  echo "Запущен: ${started_at:-"-"}"
+  echo "Трафик: ${traffic:-"-"}"
+  echo "Последняя активность по логу: ${last_log:-"-"}"
 
   if [[ "${TYPE:-}" == "mtproto" ]]; then
     echo "Домен: ${DOMAIN:-}"
@@ -373,7 +499,7 @@ show_proxy_info() {
 }
 
 create_mtproto_proxy() {
-  local id port domain secret public_ip tg_link cname cfg
+  local id port domain secret public_ip tg_link cname cfg created_at
 
   choose_proxy_id || return 1
   id="$CHOSEN_PROXY_ID"
@@ -408,6 +534,7 @@ create_mtproto_proxy() {
   fi
 
   tg_link="$(build_mtproto_link "$public_ip" "$port" "$secret")"
+  created_at="$(date '+%F %T')"
 
   print_info "Запускаю MTProto-прокси..."
   docker run -d \
@@ -435,7 +562,7 @@ create_mtproto_proxy() {
     "DOMAIN=$domain" \
     "SECRET=$secret" \
     "TG_LINK=$tg_link" \
-    "CREATED_AT=$(date '+%F %T')"
+    "CREATED_AT=$created_at"
 
   print_ok "MTProto-прокси создан."
   echo "$tg_link"
@@ -444,7 +571,7 @@ create_mtproto_proxy() {
 }
 
 create_socks5_proxy() {
-  local id port user pass public_ip tg_link cname cfg
+  local id port user pass public_ip tg_link cname cfg created_at
 
   choose_proxy_id || return 1
   id="$CHOSEN_PROXY_ID"
@@ -480,6 +607,7 @@ create_socks5_proxy() {
   fi
 
   tg_link="$(build_socks_link "$user" "$pass" "$public_ip" "$port")"
+  created_at="$(date '+%F %T')"
 
   print_info "Запускаю SOCKS5-прокси..."
   docker run -d \
@@ -508,7 +636,7 @@ create_socks5_proxy() {
     "USERNAME=$user" \
     "PASSWORD=$pass" \
     "TG_LINK=$tg_link" \
-    "CREATED_AT=$(date '+%F %T')"
+    "CREATED_AT=$created_at"
 
   print_ok "SOCKS5-прокси создан."
   echo "$tg_link"
@@ -517,7 +645,7 @@ create_socks5_proxy() {
 }
 
 list_proxies() {
-  local ids id cfg status
+  local ids id cfg status created_at started_at traffic last_log
   mapfile -t ids < <(list_proxy_ids | sort)
 
   if [[ ${#ids[@]} -eq 0 ]]; then
@@ -525,12 +653,14 @@ list_proxies() {
     return 0
   fi
 
-  printf "%-20s %-10s %-28s %-8s %-10s\n" "ID" "TYPE" "CONTAINER" "PORT" "STATUS"
-  printf "%-20s %-10s %-28s %-8s %-10s\n" "--------------------" "----------" "----------------------------" "--------" "----------"
+  printf "%-16s %-9s %-7s %-10s %-19s %-19s %-18s %-19s\n" \
+    "ID" "TYPE" "PORT" "STATUS" "CREATED" "STARTED" "TRAFFIC" "LAST_ACTIVITY"
+  printf "%-16s %-9s %-7s %-10s %-19s %-19s %-18s %-19s\n" \
+    "----------------" "---------" "-------" "----------" "-------------------" "-------------------" "------------------" "-------------------"
 
   for id in "${ids[@]}"; do
     cfg="$(config_path_by_id "$id")"
-    unset TYPE CLIENT_ID CONTAINER_NAME PORT STATUS
+    unset TYPE CLIENT_ID CONTAINER_NAME PORT CREATED_AT
     load_proxy_config "$cfg" || continue
 
     if docker_container_running "${CONTAINER_NAME:-}"; then
@@ -539,8 +669,20 @@ list_proxies() {
       status="stopped"
     fi
 
-    printf "%-20s %-10s %-28s %-8s %-10s\n" \
-      "${CLIENT_ID:-$id}" "${TYPE:-?}" "${CONTAINER_NAME:-?}" "${PORT:-?}" "$status"
+    created_at="${CREATED_AT:-"-"}"
+    started_at="$(get_started_at "${CONTAINER_NAME:-}")"
+    traffic="$(get_traffic "${CONTAINER_NAME:-}")"
+    last_log="$(get_last_log_time "${CONTAINER_NAME:-}")"
+
+    printf "%-16s %-9s %-7s %-10s %-19s %-19s %-18s %-19s\n" \
+      "${CLIENT_ID:-$id}" \
+      "${TYPE:-?}" \
+      "${PORT:-?}" \
+      "$status" \
+      "$created_at" \
+      "${started_at:-"-"}" \
+      "${traffic:-"-"}" \
+      "${last_log:-"-"}"
   done
 }
 
@@ -659,12 +801,18 @@ EOF
 }
 
 remove_all() {
-  cleanup_installation
+  if command_exists docker; then
+    cleanup_installation
+  else
+    print_warn "Docker не установлен, контейнеры пропускаю."
+    rm -rf "$BASE_DIR"
+    rm -f "$INSTALL_PATH"
+  fi
 
   read -r -p "Удалить Docker image nineseconds/mtg:2 и serjs/go-socks5-proxy? [y/N]: " ans
   ans="${ans:-N}"
 
-  if [[ "$ans" =~ ^[Yy]$ ]]; then
+  if [[ "$ans" =~ ^[Yy]$ ]] && command_exists docker; then
     docker rmi nineseconds/mtg:2 >/dev/null 2>&1 || true
     docker rmi serjs/go-socks5-proxy >/dev/null 2>&1 || true
     print_ok "Docker image удалены."
@@ -691,7 +839,12 @@ menu() {
         install_manager
         ;;
       2)
-        cleanup_installation
+        if command_exists docker; then
+          cleanup_installation
+        else
+          rm -rf "$BASE_DIR"
+          rm -f "$INSTALL_PATH"
+        fi
         install_manager
         ;;
       3)
