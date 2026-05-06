@@ -472,7 +472,7 @@ show_proxy_info() {
   echo "ID: ${CLIENT_ID:-}"
   echo "Тип: ${TYPE:-}"
   echo "Контейнер: ${CONTAINER_NAME:-}"
-  echo "Хост: ${PUBLIC_HOST:-}"
+  echo "IP/HOST: ${PUBLIC_HOST:-}"
   echo "Порт: ${PORT:-}"
   echo "Создан: ${CREATED_AT:-"-"}"
   echo "Запущен: ${started_at:-"-"}"
@@ -645,7 +645,7 @@ create_socks5_proxy() {
 }
 
 list_proxies() {
-  local ids id cfg status created_at started_at traffic last_log
+  local ids id cfg status created_at started_at traffic last_log host
   mapfile -t ids < <(list_proxy_ids | sort)
 
   if [[ ${#ids[@]} -eq 0 ]]; then
@@ -653,14 +653,14 @@ list_proxies() {
     return 0
   fi
 
-  printf "%-16s %-9s %-7s %-10s %-19s %-19s %-18s %-19s\n" \
-    "ID" "TYPE" "PORT" "STATUS" "CREATED" "STARTED" "TRAFFIC" "LAST_ACTIVITY"
-  printf "%-16s %-9s %-7s %-10s %-19s %-19s %-18s %-19s\n" \
-    "----------------" "---------" "-------" "----------" "-------------------" "-------------------" "------------------" "-------------------"
+  printf "%-16s %-9s %-18s %-7s %-10s %-19s %-19s %-18s %-19s\n" \
+    "ID" "TYPE" "IP/HOST" "PORT" "STATUS" "CREATED" "STARTED" "TRAFFIC" "LAST_ACTIVITY"
+  printf "%-16s %-9s %-18s %-7s %-10s %-19s %-19s %-18s %-19s\n" \
+    "----------------" "---------" "------------------" "-------" "----------" "-------------------" "-------------------" "------------------" "-------------------"
 
   for id in "${ids[@]}"; do
     cfg="$(config_path_by_id "$id")"
-    unset TYPE CLIENT_ID CONTAINER_NAME PORT CREATED_AT
+    unset TYPE CLIENT_ID CONTAINER_NAME PORT CREATED_AT PUBLIC_HOST
     load_proxy_config "$cfg" || continue
 
     if docker_container_running "${CONTAINER_NAME:-}"; then
@@ -673,10 +673,12 @@ list_proxies() {
     started_at="$(get_started_at "${CONTAINER_NAME:-}")"
     traffic="$(get_traffic "${CONTAINER_NAME:-}")"
     last_log="$(get_last_log_time "${CONTAINER_NAME:-}")"
+    host="${PUBLIC_HOST:-"-"}"
 
-    printf "%-16s %-9s %-7s %-10s %-19s %-19s %-18s %-19s\n" \
+    printf "%-16s %-9s %-18s %-7s %-10s %-19s %-19s %-18s %-19s\n" \
       "${CLIENT_ID:-$id}" \
       "${TYPE:-?}" \
+      "$host" \
       "${PORT:-?}" \
       "$status" \
       "$created_at" \
@@ -684,6 +686,37 @@ list_proxies() {
       "${traffic:-"-"}" \
       "${last_log:-"-"}"
   done
+}
+
+show_proxy_logs() {
+  local id cfg lines follow ans
+  choose_existing_proxy_id || return 1
+  id="$CHOSEN_PROXY_ID"
+  cfg="$(config_path_by_id "$id")"
+  load_proxy_config "$cfg" || return 1
+
+  read -r -p "Сколько последних строк показать? [100]: " lines
+  lines="$(trim "${lines:-}")"
+  if [[ -z "$lines" ]]; then
+    lines="100"
+  fi
+  if [[ ! "$lines" =~ ^[0-9]+$ ]]; then
+    print_warn "Некорректное число, ставлю 100."
+    lines="100"
+  fi
+
+  read -r -p "Следить за логами в реальном времени? [y/N]: " ans
+  ans="$(trim "${ans:-}")"
+
+  echo
+  print_info "Логи контейнера $CONTAINER_NAME"
+  echo
+
+  if [[ "$ans" =~ ^[Yy]$ ]]; then
+    docker logs -f --tail "$lines" "$CONTAINER_NAME"
+  else
+    docker logs --tail "$lines" "$CONTAINER_NAME"
+  fi
 }
 
 start_proxy() {
@@ -755,6 +788,7 @@ show_menu() {
   echo "6) Остановить прокси"
   echo "7) Перезапустить прокси"
   echo "8) Удалить прокси"
+  echo "9) Показать логи прокси"
   echo "0) Выход"
   echo "======================================="
 }
@@ -775,6 +809,7 @@ main_loop() {
       6) stop_proxy ;;
       7) restart_proxy ;;
       8) delete_proxy ;;
+      9) show_proxy_logs ;;
       0) exit 0 ;;
       *) print_warn "Неизвестный пункт меню." ;;
     esac
@@ -796,8 +831,8 @@ EOF
 
   print_ok "Установка завершена."
   echo
-  echo "Запуск менеджера:"
-  echo "  tgproxy-manager"
+  echo "Запускаю менеджер..."
+  exec "$INSTALL_PATH"
 }
 
 remove_all() {
