@@ -1,0 +1,484 @@
+#!/usr/bin/env bash
+
+set -u
+
+APP_NAME="tgproxy-manager"
+BASE_DIR="/opt/tgproxy-manager"
+PROXY_DIR="$BASE_DIR/proxies"
+BACKUP_DIR="$BASE_DIR/backups"
+EXPORT_DIR="$BASE_DIR/exports"
+
+MTG_IMAGE="nineseconds/mtg:2"
+SOCKS5_IMAGE="serjs/go-socks5-proxy"
+
+DEFAULT_DOMAINS=("google.com" "github.com" "wikipedia.org" "cloudflare.com" "telegram.org")
+PUBLIC_IP_SERVICES=("https://api.ipify.org" "https://ifconfig.me" "https://icanhazip.com")
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+mkdir -p "$PROXY_DIR" "$BACKUP_DIR" "$EXPORT_DIR"
+
+print_ok() {
+  echo -e "${GREEN}[OK]${NC} $1"
+}
+
+print_warn() {
+  echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+print_err() {
+  echo -e "${RED}[ERR]${NC} $1"
+}
+
+print_info() {
+  echo -e "${CYAN}[INFO]${NC} $1"
+}
+
+pause() {
+  read -r -p "Нажми Enter для продолжения..."
+}
+
+require_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    print_err "Запусти скрипт от root."
+    exit 1
+  fi
+}
+
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+require_dependencies() {
+  local missing=0
+
+  for cmd in docker curl openssl; do
+    if ! command_exists "$cmd"; then
+      print_err "Не найдено: $cmd"
+      missing=1
+    fi
+  done
+
+  if ! command_exists qrencode; then
+    print_warn "Не найден qrencode. QR-коды будут недоступны."
+  fi
+
+  if ! command_exists ss && ! command_exists netstat; then
+    print_warn "Не найдено ss/netstat. Проверка портов будет ограниченной."
+  fi
+
+  if [[ $missing -ne 0 ]]; then
+    exit 1
+  fi
+}
+
+ensure_docker_running() {
+  if ! docker info >/dev/null 2>&1; then
+    print_err "Docker не запущен или недоступен."
+    exit 1
+  fi
+}
+
+sanitize_id() {
+  local input="$1"
+  echo "$input" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g'
+}
+
+config_path_by_id() {
+  echo "$PROXY_DIR/$1.conf"
+}
+
+proxy_exists() {
+  local id="$1"
+  [[ -f "$(config_path_by_id "$id")" ]]
+}
+
+load_proxy_config() {
+  local id="$1"
+  local cfg
+  cfg="$(config_path_by_id "$id")"
+
+  if [[ ! -f "$cfg" ]]; then
+    print_err "Конфиг не найден: $id"
+    return 1
+  fi
+
+  # shellcheck disable=SC1090
+  source "$cfg"
+}
+
+save_proxy_config() {
+  local cfg="$1"
+  shift
+  : > "$cfg"
+  while [[ $# -gt 0 ]]; do
+    echo "$1" >> "$cfg"
+    shift
+  done
+}
+
+get_public_ip() {
+  local url
+  for url in "${PUBLIC_IP_SERVICES[@]}"; do
+    local ip
+    ip="$(curl -4 -fsS --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')"
+    if [[ -n "${ip:-}" ]]; then
+      echo "$ip"
+      return 0
+    fi
+  done
+  return 1
+}
+
+port_in_use() {
+  local port="$1"
+
+  if command_exists ss; then
+    ss -ltn "( sport = :$port )" 2>/dev/null | grep -q ":$port"
+    return $?
+  elif command_exists netstat; then
+    netstat -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$port$"
+    return $?
+  fi
+
+  return 1
+}
+
+docker_container_exists() {
+  local cname="$1"
+  docker ps -a --format '{{.Names}}' | grep -Fxq "$cname"
+}
+
+docker_container_running() {
+  local cname="$1"
+  docker ps --format '{{.Names}}' | grep -Fxq "$cname"
+}
+
+choose_proxy_id() {
+  local raw id
+  while true; do
+    read -r -p "Введите ID/имя прокси: " raw
+    raw="$(echo "$raw" | xargs)"
+    [[ -z "$raw" ]] && { print_warn "ID не может быть пустым."; continue; }
+
+    id="$(sanitize_id "$raw")"
+    [[ -z "$id" ]] && { print_warn "Некорректный ID."; continue; }
+
+    if proxy_exists "$id"; then
+      print_warn "Прокси с таким ID уже существует."
+      continue
+    fi
+
+    echo "$id"
+    return 0
+  done
+}
+
+choose_port() {
+  local port
+  while true; do
+    read -r -p "Введите порт: " port
+    port="$(echo "$port" | tr -d '[:space:]')"
+
+    if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+      print_warn "Порт должен быть числом."
+      continue
+    fi
+
+    if (( port < 1 || port > 65535 )); then
+      print_warn "Порт должен быть в диапазоне 1-65535."
+      continue
+    fi
+
+    if port_in_use "$port"; then
+      print_warn "Порт $port уже занят."
+      continue
+    fi
+
+    echo "$port"
+    return 0
+  done
+}
+
+choose_domain() {
+  local choice custom i=1
+  echo "Выбери домен маскировки:"
+  for d in "${DEFAULT_DOMAINS[@]}"; do
+    echo "  $i) $d"
+    ((i++))
+  done
+  echo "  $i) Ввести вручную"
+
+  while true; do
+    read -r -p "Твой выбор: " choice
+    if [[ "$choice" =~ ^[0-9]+$ ]]; then
+      if (( choice >= 1 && choice < i )); then
+        echo "${DEFAULT_DOMAINS[$((choice-1))]}"
+        return 0
+      elif (( choice == i )); then
+        read -r -p "Введи домен вручную: " custom
+        custom="$(echo "$custom" | xargs)"
+        if [[ -n "$custom" ]]; then
+          echo "$custom"
+          return 0
+        else
+          print_warn "Домен не может быть пустым."
+        fi
+      else
+        print_warn "Нет такого пункта."
+      fi
+    else
+      print_warn "Введи номер пункта."
+    fi
+  done
+}
+
+generate_secret() {
+  openssl rand -hex 16
+}
+
+select_proxy_from_list() {
+  local files ids=()
+  shopt -s nullglob
+  files=("$PROXY_DIR"/*.conf)
+  shopt -u nullglob
+
+  if [[ ${#files[@]} -eq 0 ]]; then
+    print_warn "Прокси пока нет."
+    return 1
+  fi
+
+  local i=1 cfg id
+  echo "Список прокси:"
+  for cfg in "${files[@]}"; do
+    id="$(basename "$cfg" .conf)"
+    ids+=("$id")
+    echo "  $i) $id"
+    ((i++))
+  done
+
+  local choice
+  while true; do
+    read -r -p "Выбери номер: " choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice < i )); then
+      echo "${ids[$((choice-1))]}"
+      return 0
+    fi
+    print_warn "Некорректный выбор."
+  done
+}
+
+pull_images() {
+  print_info "Проверяю Docker-образы..."
+  docker pull "$MTG_IMAGE" >/dev/null 2>&1 || print_warn "Не удалось заранее скачать $MTG_IMAGE"
+  docker pull "$SOCKS5_IMAGE" >/dev/null 2>&1 || print_warn "Не удалось заранее скачать $SOCKS5_IMAGE"
+}
+
+create_mtproto_proxy() {
+  local id port domain secret public_ip tg_link cname cfg
+
+  id="$(choose_proxy_id)" || return 1
+  port="$(choose_port)" || return 1
+  domain="$(choose_domain)" || return 1
+  secret="$(generate_secret)"
+  cname="tgproxy-mtg-$id"
+  cfg="$(config_path_by_id "$id")"
+
+  public_ip="$(get_public_ip || true)"
+  if [[ -z "${public_ip:-}" ]]; then
+    print_warn "Не удалось определить внешний IP автоматически."
+    read -r -p "Введи внешний IP или домен сервера вручную: " public_ip
+    public_ip="$(echo "$public_ip" | xargs)"
+    if [[ -z "$public_ip" ]]; then
+      print_err "Нужен внешний IP или домен."
+      return 1
+    fi
+  fi
+
+  print_info "Запускаю MTProto-прокси..."
+  docker run -d \
+    --name "$cname" \
+    --restart unless-stopped \
+    -p "$port:3128" \
+    "$MTG_IMAGE" \
+    simple-run \
+    -n 1 \
+    -a "0.0.0.0:3128" \
+    -t "$domain" \
+    "$secret" >/dev/null
+
+  if ! docker_container_exists "$cname"; then
+    print_err "Не удалось создать контейнер MTProto."
+    return 1
+  fi
+
+  tg_link="tg://proxy?server=$public_ip&port=$port&secret=ee$secret"
+
+  save_proxy_config "$cfg" \
+    "TYPE=mtproto" \
+    "CLIENT_ID=$id" \
+    "CONTAINER_NAME=$cname" \
+    "PORT=$port" \
+    "PUBLIC_HOST=$public_ip" \
+    "DOMAIN=$domain" \
+    "SECRET=$secret" \
+    "TG_LINK=$tg_link" \
+    "CREATED_AT=$(date '+%F %T')"
+
+  print_ok "MTProto-прокси создан."
+  echo "ID: $id"
+  echo "Контейнер: $cname"
+  echo "Порт: $port"
+  echo "Домен: $domain"
+  echo "Ссылка:"
+  echo "$tg_link"
+}
+
+create_socks5_proxy() {
+  local id port auth_choice username password cname cfg auth_mode
+  id="$(choose_proxy_id)" || return 1
+  port="$(choose_port)" || return 1
+  cname="tgproxy-socks5-$id"
+  cfg="$(config_path_by_id "$id")"
+
+  echo "Режим SOCKS5:"
+  echo "  1) Без авторизации"
+  echo "  2) Логин/пароль"
+
+  while true; do
+    read -r -p "Твой выбор: " auth_choice
+    case "$auth_choice" in
+      1)
+        auth_mode="none"
+        username=""
+        password=""
+        break
+        ;;
+      2)
+        auth_mode="password"
+        read -r -p "Логин: " username
+        read -r -s -p "Пароль: " password
+        echo
+        username="$(echo "$username" | xargs)"
+        password="$(echo "$password" | xargs)"
+        if [[ -z "$username" || -z "$password" ]]; then
+          print_warn "Логин и пароль не должны быть пустыми."
+          continue
+        fi
+        break
+        ;;
+      *)
+        print_warn "Выбери 1 или 2."
+        ;;
+    esac
+  done
+
+  print_info "Запускаю SOCKS5-прокси..."
+
+  if [[ "$auth_mode" == "password" ]]; then
+    docker run -d \
+      --name "$cname" \
+      --restart unless-stopped \
+      -p "$port:1080" \
+      -e PROXY_USER="$username" \
+      -e PROXY_PASSWORD="$password" \
+      "$SOCKS5_IMAGE" >/dev/null
+  else
+    docker run -d \
+      --name "$cname" \
+      --restart unless-stopped \
+      -p "$port:1080" \
+      "$SOCKS5_IMAGE" >/dev/null
+  fi
+
+  if ! docker_container_exists "$cname"; then
+    print_err "Не удалось создать контейнер SOCKS5."
+    return 1
+  fi
+
+  save_proxy_config "$cfg" \
+    "TYPE=socks5" \
+    "CLIENT_ID=$id" \
+    "CONTAINER_NAME=$cname" \
+    "PORT=$port" \
+    "AUTH_MODE=$auth_mode" \
+    "USERNAME=$username" \
+    "PASSWORD=$password" \
+    "CREATED_AT=$(date '+%F %T')"
+
+  print_ok "SOCKS5-прокси создан."
+  echo "ID: $id"
+  echo "Контейнер: $cname"
+  echo "Порт: $port"
+  if [[ "$auth_mode" == "password" ]]; then
+    echo "Авторизация: $username / $password"
+  else
+    echo "Авторизация: без авторизации"
+  fi
+}
+
+create_proxy() {
+  echo "Выбери тип прокси:"
+  echo "  1) MTProto (Telegram)"
+  echo "  2) SOCKS5"
+
+  local choice
+  while true; do
+    read -r -p "Твой выбор: " choice
+    case "$choice" in
+      1) create_mtproto_proxy; return ;;
+      2) create_socks5_proxy; return ;;
+      *) print_warn "Выбери 1 или 2." ;;
+    esac
+  done
+}
+
+list_proxies() {
+  local files
+  shopt -s nullglob
+  files=("$PROXY_DIR"/*.conf)
+  shopt -u nullglob
+
+  if [[ ${#files[@]} -eq 0 ]]; then
+    print_warn "Прокси пока нет."
+    return
+  fi
+
+  printf "%-20s %-10s %-8s %-15s %-12s\n" "ID" "TYPE" "PORT" "CONTAINER" "STATUS"
+  printf "%-20s %-10s %-8s %-15s %-12s\n" "--------------------" "----------" "--------" "---------------" "------------"
+
+  local cfg id status
+  for cfg in "${files[@]}"; do
+    # shellcheck disable=SC1090
+    source "$cfg"
+    if docker_container_running "$CONTAINER_NAME"; then
+      status="running"
+    else
+      status="stopped"
+    fi
+    printf "%-20s %-10s %-8s %-15s %-12s\n" "$CLIENT_ID" "$TYPE" "$PORT" "$CONTAINER_NAME" "$status"
+- командный режим помимо меню
+- установщик в один запуск
+- поддержку каскада для SOCKS5 в будущем
+
+---
+
+# Что я советую сейчас
+1. поставь скрипт
+2. создай **один MTProto**
+3. создай **один SOCKS5**
+4. проверь оба
+5. если что-то упрётся в Docker-образ SOCKS5 — я сразу подправлю код
+
+---
+
+Если хочешь, я следующим сообщением могу сделать ещё и **улучшенную v1.1**:
+- с более надёжным SOCKS5-образом
+- с автопроверкой свободного порта
+- с более аккуратной валидацией
+- и с функцией **“показать строку подключения для SOCKS5”**.
