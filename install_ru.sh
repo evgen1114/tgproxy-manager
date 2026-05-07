@@ -26,9 +26,5 @@ install -m 755 "$TMP_FILE" "$TARGET"
 rm -f "$TMP_FILE"
 
 echo "[5/5] Готово."
-echo
-echo "Запуск менеджера RU:"
-echo "tproxy-ru"
-echo
-echo "Или сразу запусти:"
-echo "/usr/local/bin/tproxy-ru"
+echo "Запускаю tproxy-ru..."
+exec /usr/local/bin/tproxy-ru
