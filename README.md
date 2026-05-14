@@ -1,17 +1,29 @@
 # TGProxy Manager
 
-Удобный менеджер для установки и управления MTProto Proxy для Telegram.
+Набор скриптов для быстрого развёртывания и управления Telegram MTProxy-схемой через EU и RU серверы.
 
-## Установка
+## Состав
 
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/evgen1114/tgproxy-manager/main/install.sh)
+В репозитории используются два основных скрипта:
 
-Повторны запуск меню
-tgproxy-manager
+- `install.sh` — установка и настройка EU-сервера
+- `ru.sh` — управление RU-сервером, создание клиентов, проброс портов, генерация ссылок и QR-кодов
 
-Удаление   
-rm -f /usr/local/bin/tgproxy-manager
-rm -rf /opt/tgproxy-manager
+---
 
-Для установки ну РУ для каскада  bash <(curl -fsSL https://raw.githubusercontent.com/evgen1114/tgproxy-manager/main/ru.sh)
+# Принцип работы
+
+Схема состоит из двух серверов:
+
+## 1. EU сервер
+EU сервер — это основной сервер с MTProxy.  
+На нём поднимается сам прокси, который принимает подключения и обрабатывает трафик.
+
+## 2. RU сервер
+RU сервер — это промежуточный сервер для клиентов.  
+Он не поднимает MTProxy напрямую, а делает TCP-проброс через `socat` на EU сервер.
+
+То есть клиент Telegram подключается так:
+
+```text
+Telegram Client -> RU Server -> EU Server (MTProxy)
