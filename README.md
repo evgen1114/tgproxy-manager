@@ -13,3 +13,5 @@ tgproxy-manager
 Удаление   
 rm -f /usr/local/bin/tgproxy-manager
 rm -rf /opt/tgproxy-manager
+
+Для установки ну РУ для каскада  bash <(curl -fsSL https://raw.githubusercontent.com/evgen1114/tgproxy-manager/main/ru.sh)
