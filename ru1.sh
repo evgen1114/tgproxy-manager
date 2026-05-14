@@ -6,16 +6,25 @@ DB_DIR="/opt/mtproxy-bridge"
 DB_FILE="$DB_DIR/clients.db"
 QR_DIR="$DB_DIR/qrcodes"
 SERVICE_PREFIX="mtproxy-forward"
-SOCAT_BIN="/usr/bin/socat"
-
-mkdir -p "$DB_DIR" "$QR_DIR"
-touch "$DB_FILE"
+SOCAT_BIN="${SOCAT_BIN:-/usr/bin/socat}"
 
 require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
     echo "Запусти скрипт от root."
     exit 1
   fi
+}
+
+require_systemd() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "Ошибка: systemctl не найден. Нужна система с systemd."
+    exit 1
+  fi
+}
+
+init_storage() {
+  mkdir -p "$DB_DIR" "$QR_DIR"
+  touch "$DB_FILE"
 }
 
 detect_pkg_manager() {
@@ -63,6 +72,7 @@ install_package_if_missing() {
 }
 
 ensure_dependencies() {
+  install_package_if_missing "curl" "curl"
   install_package_if_missing "socat" "socat"
   install_package_if_missing "qrencode" "qrencode"
 
@@ -73,24 +83,39 @@ ensure_dependencies() {
 
 get_ru_ip() {
   local ip
-  ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  ip="$(curl -4 -fsSL ifconfig.me 2>/dev/null || true)"
   if [[ -z "${ip:-}" ]]; then
-    ip="$(curl -4 -s ifconfig.me || true)"
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
   fi
   echo "$ip"
 }
 
+validate_client_name() {
+  local name="$1"
+  [[ "$name" =~ ^[a-zA-Z0-9._-]+$ ]]
+}
+
+validate_port() {
+  local port="$1"
+  [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 ))
+}
+
 port_in_use() {
   local port="$1"
-  if ss -ltn | awk '{print $4}' | grep -Eq "(^|:)$port$"; then
-    return 0
+
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn | awk '{print $4}' | grep -Eq "(^|:)$port$"
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$port$"
+  else
+    echo "Предупреждение: ss/netstat не найдены, проверка порта пропущена."
+    return 1
   fi
-  return 1
 }
 
 client_exists() {
   local name="$1"
-  grep -q "^${name}|" "$DB_FILE"
+  awk -F'|' -v n="$name" '$1 == n {found=1} END {exit !found}' "$DB_FILE"
 }
 
 service_name() {
@@ -116,13 +141,13 @@ save_client() {
 
 delete_client_from_db() {
   local name="$1"
-  grep -v "^${name}|" "$DB_FILE" > "${DB_FILE}.tmp"
+  awk -F'|' -v n="$name" '$1 != n' "$DB_FILE" > "${DB_FILE}.tmp"
   mv "${DB_FILE}.tmp" "$DB_FILE"
 }
 
 get_client_line() {
   local name="$1"
-  grep "^${name}|" "$DB_FILE" || true
+  awk -F'|' -v n="$name" '$1 == n {print; exit}' "$DB_FILE"
 }
 
 print_link_and_qr() {
@@ -212,6 +237,11 @@ create_client() {
     return
   fi
 
+  if ! validate_client_name "$name"; then
+    echo "Имя клиента может содержать только буквы, цифры, точку, дефис и подчёркивание."
+    return
+  fi
+
   if client_exists "$name"; then
     echo "Клиент с таким именем уже существует."
     return
@@ -231,6 +261,16 @@ create_client() {
 
   if [[ -z "$eu_ip" || -z "$eu_port" || -z "$secret" || -z "$ru_port" ]]; then
     echo "Все поля обязательны."
+    return
+  fi
+
+  if ! validate_port "$eu_port"; then
+    echo "EU PORT указан некорректно."
+    return
+  fi
+
+  if ! validate_port "$ru_port"; then
+    echo "RU PORT указан некорректно."
     return
   fi
 
@@ -356,5 +396,7 @@ main_menu() {
 }
 
 require_root
+require_systemd
+init_storage
 ensure_dependencies
 main_menu
