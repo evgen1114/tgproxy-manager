@@ -54,3 +54,56 @@ RU (ru.sh)
 удалить клиента
 посмотреть статус сервисов
 Для каждого клиента на RU создаётся отдельный systemd-сервис, который слушает свой порт и пересылает трафик на EU сервер.
+-------------------------------------------------------------------------------------------------------------------------
+Установка
+EU сервер
+Запуск установки EU-сервера:
+
+bash <(curl -fsSL https://raw.githubusercontent.com/evgen1114/tgproxy-manager/main/install.sh)
+
+RU сервер
+Запуск менеджера RU-сервера:
+
+bash <(curl -fsSL https://raw.githubusercontent.com/evgen1114/tgproxy-manager/main/ru.sh)
+
+Типовой сценарий работы
+Шаг 1
+Развернуть EU сервер:
+
+bash
+
+bash <(curl -fsSL https://raw.githubusercontent.com/evgen1114/tgproxy-manager/main/install.sh)
+Шаг 2
+Развернуть RU сервер:
+
+bash
+
+bash <(curl -fsSL https://raw.githubusercontent.com/evgen1114/tgproxy-manager/main/ru.sh)
+Шаг 3
+На RU через меню создать клиента и указать:
+
+IP EU сервера
+порт EU MTProxy
+secret
+внешний порт RU(порт не должен повторять EU)
+Шаг 4
+Получить готовую ссылку:
+
+text
+
+tg://proxy?server=RU_IP&port=RU_PORT&secret=SECRET
+или QR-код и передать пользователю.
+Важно
+На RU сервере должны быть открыты те порты, которые используются для клиентов.
+RU сервер должен иметь доступ до EU сервера по указанным портам.
+SECRET должен совпадать с тем, который используется на EU MTProxy.
+Если используется firewall, нужно разрешить входящие подключения на RU PORT.
+Примечание
+ru.sh не поднимает MTProxy на RU сервере.
+
+Он только делает TCP-forward на EU сервер через socat.
+
+То есть:
+
+MTProxy работает на EU
+RU работает как входная точка и пересылка трафика
